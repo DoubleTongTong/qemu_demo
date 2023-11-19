@@ -3,18 +3,62 @@
 #include <linux/pci.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
+#include <linux/cdev.h>
+#include <linux/fs.h>
 
 #define MY_PCI_VENDOR_ID 0x1234
 #define MY_PCI_DEVICE_ID 0x5678
 
-// ¸Ã½á¹¹Ìå±£´æÎÒÃÇÉè±¸ÌØ¶¨µÄĞÅÏ¢
 struct my_pci_device {
     struct pci_dev* pdev;
-    void __iomem* mmio_base; // ÄÚ´æÓ³Éä I/O »ùÖ·
-    unsigned int irq;        // ÖĞ¶ÏºÅ
+    void __iomem* mmio_base; // å†…å­˜æ˜ å°„ I/O åŸºå€
+    struct cdev cdev;       // å­—ç¬¦è®¾å¤‡
+    dev_t devt;             // è®¾å¤‡å·
 };
 
-// µ±PCIÉè±¸²åÈëÊ±µ÷ÓÃ
+static int my_pci_open(struct inode* inode, struct file* file) {
+    struct my_pci_device* dev = container_of(inode->i_cdev, struct my_pci_device, cdev);
+    file->private_data = dev;
+    return 0;
+}
+
+static int my_pci_close(struct inode* inode, struct file* file) {
+    return 0;
+}
+
+static ssize_t my_pci_read(struct file* file, char __user* buf, size_t count, loff_t* ppos) {
+    struct my_pci_device* dev = file->private_data;
+    size_t available = pci_resource_len(dev->pdev, 0) - *ppos;
+    size_t read_count = min(count, available);
+
+    if (copy_to_user(buf, dev->mmio_base + *ppos, read_count))
+        return -EFAULT;
+
+    *ppos += read_count;
+    return read_count;
+}
+
+static ssize_t my_pci_write(struct file* file, const char __user* buf, size_t count, loff_t* ppos) {
+    struct my_pci_device* dev = file->private_data;
+    size_t available = pci_resource_len(dev->pdev, 0) - *ppos;
+    size_t write_count = min(count, available);
+
+    if (copy_from_user(dev->mmio_base + *ppos, buf, write_count))
+        return -EFAULT;
+
+    *ppos += write_count;
+    return write_count;
+}
+
+static struct file_operations my_pci_fops = {
+    .owner = THIS_MODULE,
+    .read = my_pci_read,
+    .write = my_pci_write,
+    .open = my_pci_open,
+    .release = my_pci_close,
+};
+
+// å½“PCIè®¾å¤‡æ’å…¥æ—¶è°ƒç”¨
 static int my_pci_probe(struct pci_dev* pdev, const struct pci_device_id* id)
 {
     struct my_pci_device* my_dev;
@@ -23,82 +67,70 @@ static int my_pci_probe(struct pci_dev* pdev, const struct pci_device_id* id)
     printk(KERN_INFO "My PCI Device (%04x:%04x) plugged in\n",
         pdev->vendor, pdev->device);
 
-    // ·ÖÅäÉè±¸½á¹¹ÌåÄÚ´æ
-    my_dev = kzalloc(sizeof(*my_dev), GFP_KERNEL);
-    if (!my_dev) {
-        dev_err(&pdev->dev, "Unable to allocate memory for the PCI device\n");
+    my_dev = devm_kzalloc(&pdev->dev, sizeof(*my_dev), GFP_KERNEL);
+    if (!my_dev)
         return -ENOMEM;
-    }
 
-    // ±£´æÉè±¸Ö¸Õë
     my_dev->pdev = pdev;
     pci_set_drvdata(pdev, my_dev);
 
-    // ÆôÓÃPCIÉè±¸
     ret = pci_enable_device(pdev);
-    if (ret) {
-        dev_err(&pdev->dev, "Unable to enable PCI device\n");
-        goto err_enable_device;
-    }
+    if (ret)
+        return ret;
 
-    // ÇëÇóPCIÉè±¸µÄBAR0ÇøÓò
     ret = pci_request_region(pdev, 0, "my_pci_mem_region");
-    if (ret) {
-        dev_err(&pdev->dev, "Unable to request PCI I/O memory region\n");
-        goto err_request_region;
-    }
+    if (ret)
+        goto err_pci_request_region;
 
-    // ÄÚ´æÓ³ÉäPCIÉè±¸µÄBAR0ÇøÓò
     my_dev->mmio_base = ioremap(pci_resource_start(pdev, 0), pci_resource_len(pdev, 0));
     if (!my_dev->mmio_base) {
-        dev_err(&pdev->dev, "Unable to remap PCI I/O memory\n");
+        ret = -EIO;
         goto err_ioremap;
     }
 
-    // ¶ÁÈ¡²¢±£´æÖĞ¶ÏºÅ
-    my_dev->irq = pdev->irq;
+    // åˆ›å»ºå­—ç¬¦è®¾å¤‡
+    ret = alloc_chrdev_region(&my_dev->devt, 0, 1, "my_pci");
+    if (ret)
+        goto err_alloc_chrdev;
 
-    // ÔÚÕâÀï¿ÉÒÔ½øĞĞ¸ü¶àµÄ³õÊ¼»¯¹¤×÷£¬ÀıÈçÉèÖÃÖĞ¶Ï´¦Àíº¯ÊıµÈ
+    cdev_init(&my_dev->cdev, &my_pci_fops);
+    my_dev->cdev.owner = THIS_MODULE;
+    ret = cdev_add(&my_dev->cdev, my_dev->devt, 1);
+    if (ret)
+        goto err_cdev_add;
 
     return 0;
 
+err_cdev_add:
+    unregister_chrdev_region(my_dev->devt, 1);
+err_alloc_chrdev:
+    iounmap(my_dev->mmio_base);
 err_ioremap:
     pci_release_region(pdev, 0);
-err_request_region:
+err_pci_request_region:
     pci_disable_device(pdev);
-err_enable_device:
-    kfree(my_dev);
     return ret;
 }
 
-// µ±PCIÉè±¸°Î³öÊ±µ÷ÓÃ
-static void my_pci_remove(struct pci_dev* pdev)
-{
+// å½“PCIè®¾å¤‡æ‹”å‡ºæ—¶è°ƒç”¨
+static void my_pci_remove(struct pci_dev* pdev) {
     struct my_pci_device* my_dev = pci_get_drvdata(pdev);
 
-    // Çå³ıÄÚ´æÓ³Éä
-    if (my_dev->mmio_base) {
-        iounmap(my_dev->mmio_base);
-    }
-
-    // ÊÍ·ÅBAR0ÇøÓò
+    cdev_del(&my_dev->cdev);
+    unregister_chrdev_region(my_dev->devt, 1);
+    iounmap(my_dev->mmio_base);
     pci_release_region(pdev, 0);
-
-    // ½ûÓÃPCIÉè±¸
     pci_disable_device(pdev);
-
-    // ÊÍ·ÅÉè±¸½á¹¹ÌåÄÚ´æ
-    kfree(my_dev);
 }
 
-// ¶¨ÒåPCIÉè±¸ID±í
+// å®šä¹‰PCIè®¾å¤‡IDè¡¨
 static const struct pci_device_id my_pci_id_table[] = {
     { PCI_DEVICE(MY_PCI_VENDOR_ID, MY_PCI_DEVICE_ID) },
-    { 0, } // ÁĞ±íÖÕ½á·û
+    { 0, } // åˆ—è¡¨ç»ˆç»“ç¬¦
 };
 MODULE_DEVICE_TABLE(pci, my_pci_id_table);
 
-// ¶¨ÒåPCIÇı¶¯½á¹¹Ìå
+// å®šä¹‰PCIé©±åŠ¨ç»“æ„ä½“
 static struct pci_driver my_pci_driver = {
     .name = "my_pci_driver",
     .id_table = my_pci_id_table,
@@ -106,14 +138,14 @@ static struct pci_driver my_pci_driver = {
     .remove = my_pci_remove,
 };
 
-// Çı¶¯³õÊ¼»¯º¯Êı
+// é©±åŠ¨åˆå§‹åŒ–å‡½æ•°
 static int __init my_pci_init(void)
 {
     printk(KERN_INFO "My PCI Driver loaded\n");
     return pci_register_driver(&my_pci_driver);
 }
 
-// Çı¶¯ÍË³öº¯Êı
+// é©±åŠ¨é€€å‡ºå‡½æ•°
 static void __exit my_pci_exit(void)
 {
     pci_unregister_driver(&my_pci_driver);
